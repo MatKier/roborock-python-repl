@@ -640,6 +640,8 @@ class Repl:
 
     async def cmd_map(self, *args):
         files = without(args)
+        if len(files) > 1 or (files and pathlib.Path(files[0]).suffix.lower() != ".png"):
+            return self.usage("map", args)  # e.g. 'map help' must not write a PNG named help
         path = pathlib.Path(files[0] if files else "map.png").resolve()
         await self.p.map_content.refresh()
         image = self.p.map_content.image_content
@@ -915,6 +917,7 @@ HELP_SECTIONS = [
 # command -> (syntax as in HELP_SECTIONS, example, optional note): one wording for every usage message
 USAGE = {
     "info": ("info [pretty|raw]", "info raw", None),
+    "map": ("map [file.png]", "map flat.png", "saves map.png when no file is given"),
     "passes": ("passes <1-3>", "passes 2", "passes for room and zone cleaning"),
     "zone": ("zone x1 y1 x2 y2 [-y]", "zone 24000 24000 26000 26000", "coordinates in mm, see 'where'"),
     "goto": ("goto x y [-y]", "goto 25000 26000", "coordinates in mm, see 'where'"),
