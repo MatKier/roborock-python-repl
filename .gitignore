@@ -1,0 +1,20 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Map images saved with `map` (they show your home's floor plan)
+*.png
+# stray map image created by `map help`
+/help
+
+# Login session, cache and history (secrets; normally in ~/.roborock-repl/)
+.roborock-repl/
+session.json
+cache.pkl
+history
+
+# Editors
+*.un~
+*.swp
+*~
