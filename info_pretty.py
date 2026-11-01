@@ -893,8 +893,10 @@ def render_commands(names, query):
 def render_banner():
     console.rule(Text("Roborock REPL", style="bold cyan"), style="cyan")
 
-def render_logged_in(email, saved):
+def render_logged_in(email, saved, encrypted=False):
     how = "saved session, no new code needed" if saved else "session saved, next start needs no code"
+    if encrypted:
+        how += "; passphrase protected"
     say("ok", "Logged in as ", (email, "bold"), (f"  ({how})", "grey50"))
 
 def render_code_sent(email):

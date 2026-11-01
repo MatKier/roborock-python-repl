@@ -12,6 +12,8 @@ python3 -m venv .venv
 
 The first run sends a login code to your email. The session is then stored in `~/.roborock-repl/` and reused, so later runs don't request a new code. Use `--relogin` to force a new code and `--show-secrets` to print the device's `local_key` unmasked.
 
+When a login is saved you can set a passphrase (4+ characters, Enter skips). It encrypts `session.json` (the cloud login token) and `cache.pkl` (the robot's `local_key` and maps) with scrypt + AES-GCM, and every start asks for it. To add or change one, or if you forget it, run `--relogin`. Limits: a short passphrase can still be guessed offline by someone who has the files, `history` is not encrypted, and the key stays in memory while the REPL runs.
+
 ## Usage
 
 Type `help` at the `roborock>` prompt for the full list. Tab completion and history are available. The main commands are:

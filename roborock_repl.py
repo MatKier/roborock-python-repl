@@ -5,14 +5,16 @@ Interactive Roborock REPL for V1 vacuums (S7 = roborock.vacuum.a15).
     pip install -r requirements.txt   (python-roborock==7.14.1; the cache workaround depends on 7.x internals)
     python roborock_repl.py --email you@example.com
 
-First run logs in via email code and stores the session in ~/.roborock-repl/.
-Later runs reuse it (no new code request, no cloud rate limits).
+First run logs in via email code and stores the session in ~/.roborock-repl/, optionally encrypted
+(together with the device cache) with a passphrase. Later runs reuse it (no new code request, no cloud rate limits).
 """
 import argparse
 import asyncio
 import atexit
 import contextlib
 import dataclasses
+import functools
+import getpass
 import json
 import pathlib
 import pickle
@@ -36,6 +38,7 @@ from roborock.exceptions import RoborockException, RoborockInvalidCode
 from roborock.web_api import RoborockApiClient
 
 import info_pretty
+import secret_store
 
 STATE_DIR = pathlib.Path.home() / ".roborock-repl"
 SESSION_FILE = STATE_DIR / "session.json"
@@ -153,9 +156,55 @@ def tidy_history(line, remember):
         readline.remove_history_item(n - 1)
 
 
-def ainput(prompt, remember=False):
+def masked_input(prompt, mark="•"):
+    """getpass that shows a dot per typed character. Backspace and Ctrl+U edit, arrow keys are ignored.
+    Echo and line mode go off, signals stay on, so Ctrl+C still ends the script (protect_terminal
+    restores the terminal). Plain getpass without a terminal or termios."""
+    try:
+        import termios
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+    except (ImportError, OSError, ValueError):
+        return getpass.getpass(prompt)
+    raw = termios.tcgetattr(fd)
+    raw[3] &= ~(termios.ECHO | termios.ICANON)
+    raw[6][termios.VMIN], raw[6][termios.VTIME] = 1, 0
+    out, typed = sys.stdout, []
+    out.write(prompt)
+    out.flush()
+    termios.tcsetattr(fd, termios.TCSADRAIN, raw)
+    try:
+        while True:
+            ch = sys.stdin.read(1)
+            if ch in ("\n", "\r", ""):  # "" = end of input
+                break
+            if ch == "\x04" and not typed:  # Ctrl+D on an empty line, like input()
+                raise EOFError
+            if ch in ("\x7f", "\b"):
+                if typed:
+                    typed.pop()
+                    out.write("\b \b")
+            elif ch == "\x15":  # Ctrl+U: clear the line
+                out.write("\b \b" * len(typed))
+                typed.clear()
+            elif ch == "\x1b":  # escape sequence (arrow keys etc.): skip it
+                if sys.stdin.read(1) == "[":
+                    while (c := sys.stdin.read(1)) and not (c.isalpha() or c == "~"):  # e.g. ESC [ A, ESC [ 3 ~
+                        pass
+            elif ch >= " ":
+                typed.append(ch)
+                out.write(mark)
+            out.flush()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        out.write("\n")
+        out.flush()
+    return "".join(typed)
+
+
+def ainput(prompt, remember=False, secret=False):
     """input() in a daemon thread: Ctrl+C cancels the wait and exit never blocks on a pending prompt.
-    Only lines read with remember=True stay in the persistent history."""
+    Only lines read with remember=True stay in the persistent history; secret=True hides the typing."""
     loop = asyncio.get_running_loop()
     future = loop.create_future()
 
@@ -165,8 +214,11 @@ def ainput(prompt, remember=False):
 
     def read():
         try:
-            result, error = input(prompt), None
-            tidy_history(result, remember)
+            if secret:
+                result, error = masked_input(prompt), None
+            else:
+                result, error = input(prompt), None
+                tidy_history(result, remember)
         except Exception as e:  # EOFError on Ctrl+D / closed stdin
             result, error = None, e
         try:
@@ -190,21 +242,90 @@ def plain(obj, cls):
     return cls(**{f.name: getattr(obj, f.name) for f in dataclasses.fields(cls) if f.init})
 
 
-def serialize_cache(data):
+def serialize_cache(data, key=None):
     # python-roborock 7.x stores the NetworkInfo / DeviceFeatures traits themselves in the cache
     devices = {duid: dataclasses.replace(d, network_info=plain(d.network_info, NetworkInfo),
                                          device_features=plain(d.device_features, DeviceFeatures))
                for duid, d in data.device_info.items()}
-    return pickle.dumps(dataclasses.replace(data, device_info=devices))
+    pickled = pickle.dumps(dataclasses.replace(data, device_info=devices))
+    magic = secret_store.CACHE_MAGIC  # also authenticated (AAD): the header can't be swapped unnoticed
+    return magic + secret_store.encrypt(key, pickled, aad=magic) if key else pickled
+
+
+def deserialize_cache(raw, key=None):
+    """An unreadable encrypted cache (no or another passphrase, e.g. after --relogin) is dropped:
+    returning None makes FileCache start empty, and it is rebuilt from the cloud.
+    A plain cache is read as is and written encrypted on the next save when a key is set."""
+    if raw.startswith(secret_store.CACHE_MAGIC):
+        try:
+            if key is None:
+                raise secret_store.WrongKey("no passphrase")
+            raw = secret_store.decrypt(key, raw[len(secret_store.CACHE_MAGIC):], aad=secret_store.CACHE_MAGIC)
+        except secret_store.WrongKey:
+            info_pretty.render_hint("The saved device cache belongs to another login: it is rebuilt from the cloud.")
+            return None
+    return pickle.loads(raw)
+
+
+async def ask_new_passphrase():
+    """Passphrase for a newly saved login, or None (Enter) to store it unencrypted."""
+    while True:
+        first = await ainput(f"Passphrase to protect the saved login "
+                             f"({secret_store.MIN_PASSPHRASE}+ characters, Enter to skip): ", secret=True)
+        if not first:
+            return None
+        if len(first) < secret_store.MIN_PASSPHRASE:
+            info_pretty.render_problem(f"At least {secret_store.MIN_PASSPHRASE} characters, please.")
+            continue
+        if await ainput("Repeat: ", secret=True) == first:
+            return first
+        info_pretty.render_problem("The two entries differ. Try again.")
+
+
+async def unlock(saved):
+    """Key for an encrypted session (3 tries). Raises RoborockException when they all fail."""
+    for attempt in range(1, 4):
+        passphrase = await ainput("Passphrase: ", secret=True)
+        with info_pretty.console.status("Unlocking ..."):
+            key = secret_store.derive_key(passphrase, saved["kdf"])
+            try:
+                return UserData.from_dict(json.loads(
+                    secret_store.decrypt(key, secret_store.unb64(saved["user_data_enc"])))), key
+            except secret_store.WrongKey:
+                pass
+        if attempt < 3:
+            info_pretty.render_problem("Wrong passphrase.")
+    raise RoborockException("Wrong passphrase 3 times. Forgotten it? --relogin logs in again and sets a new one.")
+
+
+def save_session(email, user_data, passphrase):
+    """Writes session.json; returns the cache key (None without passphrase)."""
+    session, key = {"email": email}, None
+    plain_json = json.dumps(user_data.as_dict(), default=vars)
+    if passphrase:
+        kdf = secret_store.new_kdf()
+        with info_pretty.console.status("Encrypting ..."):
+            key = secret_store.derive_key(passphrase, kdf)
+        session |= {"kdf": kdf, "user_data_enc": secret_store.b64(secret_store.encrypt(key, plain_json.encode()))}
+    else:
+        session["user_data"] = json.loads(plain_json)
+    SESSION_FILE.write_text(json.dumps(session))
+    SESSION_FILE.chmod(0o600)
+    return key
 
 
 async def load_user_data(email, relogin):
+    """(user data, cache key or None). The passphrase is only chosen when a new login is saved."""
     STATE_DIR.mkdir(exist_ok=True)
     if SESSION_FILE.exists() and not relogin:
         saved = json.loads(SESSION_FILE.read_text())
         if saved["email"] == email:
-            info_pretty.render_logged_in(email, saved=True)
-            return UserData.from_dict(saved["user_data"])
+            if "user_data_enc" in saved:
+                user_data, key = await unlock(saved)
+            else:
+                user_data, key = UserData.from_dict(saved["user_data"]), None
+            info_pretty.render_logged_in(email, saved=True, encrypted=key is not None)
+            return user_data, key
 
     api = RoborockApiClient(username=email)
     with info_pretty.console.status("Requesting a login code ..."):
@@ -220,10 +341,9 @@ async def load_user_data(email, relogin):
             if attempt == 3:
                 raise
             info_pretty.render_problem("That code was not accepted. Check the newest email and try again.")
-    SESSION_FILE.write_text(json.dumps({"email": email, "user_data": user_data.as_dict()}, default=vars))
-    SESSION_FILE.chmod(0o600)
-    info_pretty.render_logged_in(email, saved=False)
-    return user_data
+    key = save_session(email, user_data, await ask_new_passphrase())
+    info_pretty.render_logged_in(email, saved=False, encrypted=key is not None)
+    return user_data, key
 
 
 async def wait_connected(device, timeout=20):
@@ -1040,8 +1160,9 @@ async def main():
     protect_terminal()
     setup_readline()
     info_pretty.render_banner()
-    user_data = await load_user_data(args.email, args.relogin)
-    cache = FileCache(CACHE_FILE, serialize_fn=serialize_cache)
+    user_data, key = await load_user_data(args.email, args.relogin)
+    cache = FileCache(CACHE_FILE, serialize_fn=functools.partial(serialize_cache, key=key),
+                      deserialize_fn=functools.partial(deserialize_cache, key=key))
     with info_pretty.console.status("Loading your devices ..."):
         manager = await create_device_manager(UserParams(username=args.email, user_data=user_data), cache=cache)
     try:
@@ -1065,6 +1186,8 @@ async def main():
         with info_pretty.console.status("Disconnecting ..."):
             try:
                 await cache.flush()
+                if CACHE_FILE.exists():
+                    CACHE_FILE.chmod(0o600)  # FileCache creates it with the default umask
             finally:
                 await manager.close()
     info_pretty.render_goodbye(goodbye)
