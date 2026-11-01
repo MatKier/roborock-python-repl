@@ -2,6 +2,10 @@
 
 Interactive command line for controlling and inspecting Roborock V1 vacuums (tested on an S7, `roborock.vacuum.a15`) through the Roborock cloud account.
 
+> **Disclaimer:** This is an unofficial hobby project. It is not affiliated with, endorsed by or supported by Roborock. "Roborock" is a trademark of its owner. Use at your own risk: it sends real commands to your robot.
+
+![Selecting rooms, checking the status and starting a clean](docs/clean.svg)
+
 ## Setup
 
 ```
@@ -26,8 +30,21 @@ Type `help` at the `roborock>` prompt for the full list. Tab completion and hist
 
 Commands that move the robot ask for confirmation first. Add `-y` to skip the prompt.
 
+<details>
+<summary>Full command list (<code>help</code>)</summary>
+
+![The help screen](docs/help.svg)
+
+</details>
+
 `map` saves a PNG of your floor plan. `*.png` is ignored by git so the image isn't committed by accident.
 
 ## Acknowledgement
 
 This script is only a thin interface on top of [python-roborock](https://github.com/Python-roborock/python-roborock), and it would not work without that library. The library does all the real work: cloud login, device discovery, the MQTT/local protocol and map parsing. The cache workaround in `roborock_repl.py` depends on python-roborock 7.x internals, so keep the version pinned in `requirements.txt`.
+
+The screenshots use sample data and are generated with `docs/make_screenshots.py`.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
