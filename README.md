@@ -30,6 +30,11 @@ Type `help` at the `roborock>` prompt for the full list. Tab completion and hist
 
 Commands that move the robot ask for confirmation first. Add `-y` to skip the prompt.
 
+After the computer sleeps or the connection drops, the next command checks the connection and reconnects if needed.
+If it fails, commands that only read are tried once more. Commands that act on the robot are never resent: the REPL
+tells you whether the robot received the command. `reconnect` does the same on demand. The prompt changes to
+`roborock (offline)>` while the robot can't be reached. Ctrl+C cancels a running command; at the prompt it quits.
+
 <details>
 <summary>Full command list (<code>help</code>)</summary>
 

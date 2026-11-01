@@ -22,6 +22,7 @@ import shlex
 import signal
 import sys
 import threading
+import time
 
 try:
     import readline  # line editing, tab completion and history where available
@@ -34,7 +35,7 @@ from roborock.device_features import DeviceFeatures
 from roborock.devices.device_manager import UserParams, create_device_manager
 from roborock.devices.file_cache import FileCache
 from roborock.devices.traits.v1.consumeable import ConsumableAttribute
-from roborock.exceptions import RoborockException, RoborockInvalidCode
+from roborock.exceptions import RoborockConnectionException, RoborockException, RoborockInvalidCode, RoborockTimeout
 from roborock.web_api import RoborockApiClient
 
 import info_pretty
@@ -49,6 +50,27 @@ HISTORY_LENGTH = 1000
 NO_RAW_COMMANDS = {"cls", "quit", "exit"}  # nothing to show plainly
 START_TIMEOUT, START_POLL = 30, 2  # seconds: how long / how often to check that a started action really runs
 ASKING_COMMANDS = {"clean", "zone", "goto", "spot", "resume", "pause", "stop", "dock", "routine"}  # accept -y
+# Connection upkeep (seconds). The library's own recovery after a sleep can take minutes (MQTT backoff up to 6 h),
+# so the REPL checks the line before a command and builds fresh connections when it is dead.
+SLEEP_GAP = 60  # wall clock ran this much further than the monotonic clock: the computer was asleep
+IDLE_CHECK = 5 * 60  # no robot answer for this long: check the line before the next command
+PROBE_TIMEOUT = 4  # the quick status read that checks the line
+RECONNECT_TRY_FOR = 30  # keep trying this long (Wi-Fi often comes back a few seconds after a wake-up)
+RECONNECT_FLOOR = 30  # at least this long between automatic reconnects (each is a new cloud login)
+CLOSE_TIMEOUT = 5  # closing connections that died in a sleep must not hang
+# commands that never talk to the robot: no connection check before them
+LOCAL_COMMANDS = {"help", "cls", "clear", "passes", "select", "rooms", "floors", "commands", "reconnect"}
+# safe to send again automatically after a dropped connection: they only read
+READ_ONLY_COMMANDS = {"info", "status", "consumables", "history", "where", "map", "options", "routines"}
+SHOW_OR_SET_COMMANDS = {"fan", "water", "route", "mode", "volume", "dnd", "childlock", "led", "floor", "reset",
+                        "routine"}  # read-only without a value
+DELIVERY_RAW = {  # raw-mode line after a dropped connection, by Repl.delivery
+    "unsent": "Nothing was sent to the robot: run the command again.",
+    "unknown": "The command may or may not have reached the robot: check 'status'.",
+    "accepted": "Accepted by the robot; only the follow-up read was cut off.",
+}
+CONNECTION_ERROR_TEXT = ("timed out", "not connected", "failed to publish", "no available connection",
+                         "failed to connect")
 
 OPTIONAL_TRAITS = [
     "child_lock", "led_status", "flow_led_status", "valley_electricity_timer",
@@ -347,24 +369,249 @@ async def load_user_data(email, relogin):
 
 
 async def wait_connected(device, timeout=20):
-    for _ in range(timeout * 2):
-        if device.is_connected:
-            return True
+    loop = asyncio.get_running_loop()
+    end = loop.time() + timeout
+    while not device.is_connected:
+        if loop.time() >= end:
+            return False
         await asyncio.sleep(0.5)
-    return False
+    return True
+
+
+def is_connection_error(error):
+    """The line to the robot is gone (as opposed to the robot answering with an error).
+    python-roborock 7.x raises a plain RoborockException for timeouts, hence the text check."""
+    return isinstance(error, (RoborockTimeout, RoborockConnectionException)) or (
+        type(error) is RoborockException and any(t in str(error).lower() for t in CONNECTION_ERROR_TEXT))
+
+
+def retry_safe(command, args):
+    """May this command be sent again automatically after a dropped connection? Only if it just reads."""
+    return command in READ_ONLY_COMMANDS or (command in SHOW_OR_SET_COMMANDS and not without(args, "raw", "-y"))
+
+
+class Connection:
+    """The device manager and the chosen vacuum. reconnect() replaces both with fresh connections:
+    a new MQTT session and local socket, none of the library's backoff left over from before a sleep."""
+
+    def __init__(self, user_params, cache):
+        self.user_params, self.cache = user_params, cache
+        self.manager = self.device = None
+        self.last_reconnect = None  # loop time of the last reconnect attempt
+
+    async def vacuums(self):
+        self.manager = await create_device_manager(self.user_params, cache=self.cache)
+        return [d for d in await self.manager.get_devices() if d.v1_properties]
+
+    async def reconnect(self):
+        """Fresh connections to the same robot, retried for RECONNECT_TRY_FOR seconds. self.device is the new
+        device even when this fails (the library keeps trying in the background); raises when it stays unreachable."""
+        loop = asyncio.get_running_loop()
+        self.last_reconnect = loop.time()
+        deadline = loop.time() + RECONNECT_TRY_FOR
+        duid, name = self.device.duid, self.device.name
+        while True:
+            await self.close_manager()
+            try:
+                vacuums = await self.vacuums()
+            except RoborockException as e:  # e.g. no network yet for the home data
+                problem = e
+            else:
+                device = next((d for d in vacuums if d.duid == duid), None)
+                if device is None:
+                    raise RoborockException(f"{name} is no longer on this account.")
+                self.device = device
+                if await wait_connected(device, max(5, deadline - loop.time())):
+                    return device
+                problem = "robot offline or unreachable"
+            if loop.time() >= deadline:
+                raise RoborockConnectionException(f"Could not reach {name}: {problem}")
+            await asyncio.sleep(3)
+
+    async def close_manager(self):
+        if self.manager is not None:
+            manager, self.manager = self.manager, None
+            with contextlib.suppress(Exception):  # a timeout, or whatever a connection that died in a sleep raises
+                await asyncio.wait_for(manager.close(), CLOSE_TIMEOUT)
+
+    async def close(self):
+        try:
+            await self.cache.flush()
+            if CACHE_FILE.exists():
+                CACHE_FILE.chmod(0o600)  # FileCache creates it with the default umask
+        finally:
+            await self.close_manager()
 
 
 class Repl:
-    def __init__(self, device, show_secrets):
-        self.device = device
-        self.p = device.v1_properties
+    def __init__(self, conn, show_secrets):
+        self.conn = conn
+        self.adopt(conn.device)
         self.show_secrets = show_secrets
+        self.last_ok = (time.time(), time.monotonic())  # last robot answer: wall clock and monotonic clock
+        self.delivery = "unknown"  # of the running command: unsent / unknown (on its way) / accepted by the robot
+        self.running = None  # the command task Ctrl+C cancels
+        self.sigint_default = None  # Ctrl+C handler outside commands (asyncio.run's: ends the script)
         self.selected = []  # segment ids
         self.passes = 1
         self._matches = []
         self.routines = None  # cloud data, cached for Tab completion (None = not loaded / failed)
         if readline is not None:
             readline.set_completer(self.complete)
+
+    def adopt(self, device):
+        """Use this device object (a reconnect brings a new one); selection, passes and routines stay."""
+        self.device = device
+        self.p = device.v1_properties
+
+    # ---------- connection upkeep ----------
+
+    def mark_ok(self):
+        self.last_ok = (time.time(), time.monotonic())
+
+    async def ensure_connection(self):
+        """Before a command that talks to the robot: after a sleep, a long pause or a drop, check the line and
+        reconnect when it's dead. False = the robot stays unreachable and the command is skipped."""
+        wall, mono = time.time(), time.monotonic()
+        slept = (wall - self.last_ok[0]) - (mono - self.last_ok[1]) > SLEEP_GAP  # monotonic stops during sleep
+        idle = mono - self.last_ok[1] > IDLE_CHECK
+        if self.device.is_connected:
+            if not slept and not idle:
+                return True
+            try:
+                with info_pretty.console.status("Checking the connection ..."):
+                    await asyncio.wait_for(self.p.status.refresh(), PROBE_TIMEOUT)
+                self.mark_ok()
+                return True
+            except (RoborockException, TimeoutError):
+                pass
+        return await self.reconnect("the computer was asleep" if slept else "the connection dropped")
+
+    async def reconnect(self, reason=None):
+        """Fresh connections to the robot. reason=None: asked for by 'reconnect', so no wait between attempts."""
+        loop = asyncio.get_running_loop()
+        name = self.device.name
+        if reason and self.conn.last_reconnect is not None \
+                and loop.time() - self.conn.last_reconnect < RECONNECT_FLOOR:
+            info_pretty.render_still_offline(name)  # don't hammer the cloud login
+            return False
+        if reason:
+            info_pretty.render_connection_lost(reason)
+        try:
+            with info_pretty.console.status(info_pretty.Text(f"Reconnecting to {name} ...")):
+                await self.conn.reconnect()
+        except RoborockException as e:
+            info_pretty.render_reconnect_failed(e)
+            return False
+        finally:
+            self.adopt(self.conn.device)
+        with info_pretty.console.status("Reading the status ..."):
+            await self.reload_basics()
+        info_pretty.render_connected(self.device)
+        self.mark_ok()
+        return True
+
+    async def reload_basics(self):
+        """A new device object starts empty: status (current floor) and rooms, for 'rooms' and Tab completion.
+        The floor list comes from the cache; nothing here is worth failing the reconnect for."""
+        with contextlib.suppress(RoborockException):
+            await self.p.status.refresh()
+        try:
+            await self.p.home.discover_home()
+        except RoborockException:
+            with contextlib.suppress(RoborockException):
+                await self.p.rooms.refresh()
+
+    async def cmd_reconnect(self, *_):
+        await self.reconnect()
+
+    @contextlib.contextmanager
+    def ctrl_c_cancels(self, task):
+        """While a command runs, Ctrl+C cancels just that command instead of ending the script."""
+        self.running = task
+        self.arm_ctrl_c()
+        try:
+            yield
+        finally:
+            self.disarm_ctrl_c()
+            self.running = None
+
+    @contextlib.contextmanager
+    def ctrl_c_ends(self):
+        """Around a prompt inside a command: Ctrl+C ends the script, as at the main prompt.
+        Cancelling would leave the prompt's reader thread waiting, and it would swallow the next line."""
+        self.disarm_ctrl_c()
+        try:
+            yield
+        finally:
+            self.arm_ctrl_c()
+
+    def arm_ctrl_c(self):
+        if self.running is None:
+            return
+        self.sigint_default = signal.getsignal(signal.SIGINT)
+        try:
+            asyncio.get_running_loop().add_signal_handler(signal.SIGINT, self.running.cancel)
+        except (NotImplementedError, RuntimeError):  # no signal handlers in this loop (Windows): Ctrl+C ends the script
+            self.sigint_default = None
+
+    def disarm_ctrl_c(self):
+        if self.sigint_default is None:
+            return
+        asyncio.get_running_loop().remove_signal_handler(signal.SIGINT)
+        signal.signal(signal.SIGINT, self.sigint_default)  # remove_signal_handler alone would drop asyncio.run's
+        self.sigint_default = None
+
+    async def execute(self, command, handler, args):
+        """One command: connection check, the command, and after a dropped connection a reconnect
+        plus one more try, but only for commands that just read. Anything else is never sent twice."""
+        if command in LOCAL_COMMANDS:  # no robot involved: also leaves the sleep detection alone
+            return await handler(*args)
+        if not await self.ensure_connection():
+            return
+        self.delivery = "unknown"
+        try:
+            await handler(*args)
+            self.mark_ok()
+        except RoborockException as e:
+            if not is_connection_error(e):
+                raise
+            self.render_failure(e, args)
+            again, delivery = retry_safe(command, args), self.delivery
+            if await self.reconnect("the connection dropped") and again:
+                info_pretty.render_hint("Trying once more ...")
+                await handler(*args)
+                self.mark_ok()
+            elif not again:
+                if "raw" in args:
+                    raw_line(DELIVERY_RAW[delivery])
+                else:
+                    info_pretty.render_delivery(delivery)
+
+    async def dispatch(self, parts):
+        """Run one command line (already split): Ctrl+C cancels it, errors are shown, the REPL goes on."""
+        handler = getattr(self, f"cmd_{parts[0]}", None)
+        if handler is None:
+            return info_pretty.render_unknown_command(parts[0], self.command_names())
+        task = asyncio.ensure_future(self.execute(parts[0], handler, parts[1:]))
+        try:
+            with self.ctrl_c_cancels(task):
+                await task
+        except asyncio.CancelledError:
+            if asyncio.current_task().cancelling():
+                raise  # the REPL itself is being cancelled
+            if "raw" in parts[1:]:
+                raw_line("Cancelled: the robot may already have received the command.")
+            else:
+                info_pretty.render_command_cancelled()
+        except (RoborockException, ValueError) as e:  # ValueError covers bad numbers and bad JSON
+            self.render_failure(e, parts[1:])
+
+    def render_failure(self, error, args):
+        if "raw" in args:
+            raw_line(f"Error: {error}")
+        else:
+            info_pretty.render_error(error)
 
     # ---------- tab completion (runs in the input thread: only data already in memory, no robot calls) ----------
 
@@ -429,24 +676,42 @@ class Repl:
         problems = []
         traits = ["status", "consumables", "clean_summary", "dnd", "sound_volume", "maps", "network_info"]
         traits += [t for t in OPTIONAL_TRAITS if getattr(self.p, t) is not None]
+        streak = []  # connection errors in a row
+
+        def note(source, error):
+            self.give_up_if_dead(error, streak)
+            if is_connection_error(error):
+                streak.append(error)
+            else:
+                streak.clear()
+            problems.append((source, error))
+
         for name in traits:
             try:
                 await getattr(self.p, name).refresh()
+                streak.clear()
             except RoborockException as e:
-                problems.append((name, e))
+                note(name, e)
         try:
             await self.p.home.discover_home()
         except RoborockException as e:
-            problems.append(("home", e))
+            note("home", e)
             try:
                 await self.p.rooms.refresh()
             except RoborockException as e2:
-                problems.append(("rooms", e2))
+                note("rooms", e2)
         try:
             await self.load_routines()
         except RoborockException as e:
-            problems.append(("routines", e))
+            note("routines", e)
         return problems
+
+    def give_up_if_dead(self, error, streak):
+        """In a series of reads: stop at a connection error when the line looks dead (not connected, or the second
+        in a row; streak = the ones just before), so an outage costs one or two timeouts, not one per read.
+        A single slow read stays a listed problem."""
+        if is_connection_error(error) and (streak or not self.device.is_connected):
+            raise error
 
     async def load_routines(self):
         """Fetch the routines from the Roborock cloud and keep them for completion and the overview."""
@@ -634,6 +899,7 @@ class Repl:
         if (code := codes.get(values[0].lower())) is None:
             return await self.show_options(label, list(mapping.values()), raw, unknown=values[0])
         await self.p.command.send(command, [code])
+        self.delivery = "accepted"
         await self.cmd_status(*(["raw"] if raw else []))
 
     async def cmd_options(self, *args):
@@ -668,7 +934,9 @@ class Repl:
     # ---------- actions ----------
 
     async def send(self, command, params=None):
+        self.delivery = "unknown"
         result = await self.p.command.send(command, params)
+        self.delivery = "accepted"
         raw_line(f"{command} -> {result}")
         return result
 
@@ -689,11 +957,18 @@ class Repl:
         if raw and detail:
             question = f"{question} ({detail})"
         try:
-            answer = (await ainput(f"{question}? [y/N] ")).strip().lower()
+            with self.ctrl_c_ends():
+                answer = (await ainput(f"{question}? [y/N] ")).strip().lower()
         except EOFError:
             answer = ""
         if answer in ("y", "yes", "j", "ja"):
-            return True
+            if await self.ensure_connection():  # the prompt may have waited through a sleep
+                return True
+            if raw:
+                raw_line("Nothing was sent to the robot.")
+            else:
+                info_pretty.render_hint("Nothing was sent to the robot.")
+            return False
         if raw:
             raw_line(f"Cancelled: {info_pretty.CANCELLED_DETAIL}")
         else:
@@ -701,7 +976,9 @@ class Repl:
         return False
 
     async def send_pretty(self, command, params=None, label=None):
+        self.delivery = "unknown"
         result = await self.p.command.send(command, params)
+        self.delivery = "accepted"
         info_pretty.render_sent(command, result, label)
         return result
 
@@ -709,6 +986,7 @@ class Repl:
         """The one path for commands that act on the robot: plan → confirm → send (→ check it started).
         Raw mode skips the plan and names the exact command in its question; ask=None sends right away (find).
         starts=True: the command should set the robot working, so watch the status afterwards (check_started)."""
+        self.delivery = "unsent"  # until send() / send_pretty()
         raw = "raw" in args
         if raw:
             if ask and not await self.confirm(args, ask, detail=f"{command.value} {params or ''}".rstrip()):
@@ -732,7 +1010,7 @@ class Repl:
     async def check_started(self, raw, before):
         """Accepted is not started: a missing dust bin, for example, only shows up in the status afterwards.
         Polls the status until the robot works, reports a (new) error, or START_TIMEOUT passes.
-        Ctrl+C only stops the waiting, not the robot."""
+        Ctrl+C (which cancels the command, see ctrl_c_cancels) only stops the waiting, not the robot."""
         status, loop = self.p.status, asyncio.get_running_loop()
         started = loop.time()
 
@@ -747,16 +1025,15 @@ class Repl:
                     return "error"
             return "error" if any(errors_of(status)) else "timeout"  # an old error kept it from starting
 
-        task = asyncio.ensure_future(poll())
-        loop.add_signal_handler(signal.SIGINT, task.cancel)
         try:
             with contextlib.nullcontext() if raw else \
                     info_pretty.console.status("Checking that the robot starts ... (Ctrl+C stops waiting)"):
-                outcome = await task
+                outcome = await poll()
         except asyncio.CancelledError:
+            if self.running is None or self.running is not asyncio.current_task():
+                raise  # not our Ctrl+C (e.g. shutting down)
+            self.running.uncancel()  # the command itself goes on: report what was seen so far
             outcome = "cancelled"
-        finally:
-            loop.remove_signal_handler(signal.SIGINT)
         waited = round(loop.time() - started)
         if raw:
             dock, error = errors_of(status)
@@ -769,7 +1046,7 @@ class Repl:
         if with_map:
             try:
                 await self.p.map_content.refresh()  # for the mini map; the command is sent either way
-            except RoborockException as e:
+            except RoborockException as e:  # MQTT only: may fail while the local line works
                 info_pretty.render_warning(f"No map preview: {e}")
 
     async def cmd_clean(self, *args):
@@ -933,20 +1210,25 @@ class Repl:
 
     async def fetch_records(self, count):
         """[(record_id, CleanRecord)] of the newest runs; a record the robot can't deliver is skipped."""
-        records = []
+        records, streak = [], []
         for record_id in (self.p.clean_summary.records or [])[:count]:
             try:
                 records.append((record_id, await self.p.clean_summary.get_clean_record(record_id)))
-            except RoborockException:
-                pass
+                streak.clear()
+            except RoborockException as e:  # a record the robot can't deliver is skipped
+                self.give_up_if_dead(e, streak)
+                if is_connection_error(e):
+                    streak.append(e)
         return records
 
     async def cmd_routines(self, *args):
         if "raw" not in args:
             try:
                 await self.load_routines()
-            except RoborockException:
-                pass  # shown as "could not be loaded"
+            except RoborockException as e:
+                if is_connection_error(e):
+                    raise
+                # otherwise shown as "could not be loaded"
             return info_pretty.render_routines(self.routines)
         self.dump_routines(await self.load_routines())
 
@@ -954,6 +1236,7 @@ class Repl:
         dump("Routines", [r.as_dict() for r in routines], info_pretty.gist(f"{len(routines)} routines on this account"))
 
     async def cmd_routine(self, *args):
+        self.delivery = "unsent"
         values = without(args, "raw", "-y")
         if not values:
             return await self.cmd_routines(*args)
@@ -961,7 +1244,9 @@ class Repl:
             if await self.confirm(args, f"Start routine {int(values[0])}"):
                 await self.p.status.refresh()
                 before = errors_of(self.p.status)
+                self.delivery = "unknown"
                 await self.p.routines.execute_routine(int(values[0]))
+                self.delivery = "accepted"
                 raw_line("Routine started.")
                 await self.check_started(True, before)
             return
@@ -977,7 +1262,9 @@ class Repl:
             return
         await self.p.status.refresh()
         before = errors_of(self.p.status)
+        self.delivery = "unknown"
         await self.p.routines.execute_routine(matches[0].id)
+        self.delivery = "accepted"
         info_pretty.render_done("Routine started via the Roborock cloud")
         await self.check_started(False, before)
 
@@ -1023,8 +1310,9 @@ class Repl:
     async def run(self):
         await self.cmd_help()
         while True:
+            prompt = "roborock> " if self.device.is_connected else "roborock (offline)> "
             try:
-                parts = shlex.split(await ainput("roborock> ", remember=True))
+                parts = shlex.split(await ainput(prompt, remember=True))
             except EOFError:
                 return print()
             except ValueError as e:  # e.g. unbalanced quotes
@@ -1034,17 +1322,7 @@ class Repl:
                 continue
             if parts[0] in ("quit", "exit"):
                 return
-            handler = getattr(self, f"cmd_{parts[0]}", None)
-            if handler is None:
-                info_pretty.render_unknown_command(parts[0], self.command_names())
-                continue
-            try:
-                await handler(*parts[1:])
-            except (RoborockException, ValueError) as e:  # ValueError covers bad numbers and bad JSON
-                if "raw" in parts[1:]:
-                    raw_line(f"Error: {e}")
-                else:
-                    info_pretty.render_error(e)
+            await self.dispatch(parts)
 
 
 # (title, color, [(command, description)]): rendered by `help`, plain text by `help raw`
@@ -1092,6 +1370,7 @@ HELP_SECTIONS = [
     ("General", "grey50", [
         ("help [examples]", "this list | step-by-step examples"),
         ("cls", "clear screen and scrollback, then show banner and connection ('clear' clears the room selection)"),
+        ("reconnect", "fresh connections to the robot (done automatically after a sleep or a drop)"),
         ("quit", "leave"),
     ]),
 ]
@@ -1109,7 +1388,8 @@ USAGE = {
     "raw": ("raw <cmd> [json]", "raw set_custom_mode [102]", "'commands' lists them"),
 }
 HELP_FOOTER = ("Display commands accept raw for the plain output, e.g. 'status raw', 'help raw'.\n"
-               "Tab completes commands and their arguments; ↑/↓ and Ctrl+R search the history, kept across sessions.")
+               "Tab completes commands and their arguments; ↑/↓ and Ctrl+R search the history, kept across sessions.\n"
+               "Ctrl+C cancels a running command; at the prompt it quits.")
 HELP_WIDTH = max(len(cmd) for _, _, rows in HELP_SECTIONS for cmd, _ in rows) + 2  # >= 2 spaces before descriptions
 HELP = "\n" + "\n".join(f"{cmd:<{HELP_WIDTH}}{desc}" for _, _, rows in HELP_SECTIONS for cmd, desc in rows) \
     + f"\n\n{HELP_FOOTER}\n"
@@ -1163,14 +1443,14 @@ async def main():
     user_data, key = await load_user_data(args.email, args.relogin)
     cache = FileCache(CACHE_FILE, serialize_fn=functools.partial(serialize_cache, key=key),
                       deserialize_fn=functools.partial(deserialize_cache, key=key))
-    with info_pretty.console.status("Loading your devices ..."):
-        manager = await create_device_manager(UserParams(username=args.email, user_data=user_data), cache=cache)
+    conn = Connection(UserParams(username=args.email, user_data=user_data), cache)
     try:
-        vacuums = [d for d in await manager.get_devices() if d.v1_properties]
+        with info_pretty.console.status("Loading your devices ..."):
+            vacuums = await conn.vacuums()
         if not vacuums:
             return info_pretty.render_problem("No V1 vacuum found on this account.")
         info_pretty.render_devices(vacuums)
-        device = vacuums[0] if len(vacuums) == 1 else await choose_device(vacuums)
+        device = conn.device = vacuums[0] if len(vacuums) == 1 else await choose_device(vacuums)
 
         with info_pretty.console.status(info_pretty.Text(f"Connecting to {device.name} ...")):
             connected = await wait_connected(device)
@@ -1178,18 +1458,13 @@ async def main():
             return info_pretty.render_problem(f"Could not connect to {device.name}: robot offline or unreachable.")
         info_pretty.render_connected(device)
 
-        repl = Repl(device, args.show_secrets)
-        await repl.cmd_info()
+        repl = Repl(conn, args.show_secrets)
+        await repl.dispatch(["info"])
         await repl.run()
-        goodbye = device.name  # only after a normal quit; Ctrl+C and errors print their own line
+        goodbye = conn.device.name  # only after a normal quit; Ctrl+C and errors print their own line
     finally:
         with info_pretty.console.status("Disconnecting ..."):
-            try:
-                await cache.flush()
-                if CACHE_FILE.exists():
-                    CACHE_FILE.chmod(0o600)  # FileCache creates it with the default umask
-            finally:
-                await manager.close()
+            await conn.close()
     info_pretty.render_goodbye(goodbye)
 
 

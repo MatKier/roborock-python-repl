@@ -30,7 +30,7 @@ from rich.tree import Tree
 from roborock import const
 from vacuum_map_parser_base.map_data import Point
 from roborock.exceptions import (CommandVacuumError, RoborockConnectionException, RoborockDeviceBusy,
-                                 RoborockTimeout, UnknownMethodError, VacuumError)
+                                 RoborockException, RoborockTimeout, UnknownMethodError, VacuumError)
 
 # ---------- styles, console and constants ----------
 
@@ -954,7 +954,7 @@ def describe_error(error):
         if m := re.match(r"invalid literal for int\(\) with base 10: (.*)", text):
             return f"Expected a whole number, got {m[1]}", None
         return f"Invalid input: {text}", None
-    if isinstance(error, RoborockTimeout):
+    if isinstance(error, RoborockTimeout) or (type(error) is RoborockException and "timed out" in text.lower()):
         return "The robot didn't answer in time", "Is it online and in Wi-Fi range? Try again in a moment."
     if isinstance(error, RoborockDeviceBusy):
         return f"The robot is busy: {text}", "Wait until it is idle or docked, then try again."
@@ -975,6 +975,33 @@ def render_error(error):
 def render_usage(syntax, example, note=None):
     say("no", ("Usage: ", "yellow"), command_text(syntax, "cyan"))
     console.print(Text.assemble(("  e.g. ", "grey50"), (example, "cyan"), (f"  ·  {note}" if note else "", "grey50")))
+
+def render_connection_lost(reason):
+    say("warn", ("Connection lost", "yellow"), f" ({reason}): reconnecting ...")
+
+def render_reconnect_failed(error):
+    say("error", (str(error), "red"))
+    render_hint("Check the network and the robot's Wi-Fi. 'reconnect' tries again.")
+
+def render_still_offline(name):
+    say("error", ("Still no connection to ", "red"), (name, "bold"),
+        ("  (just tried to reconnect)", "grey50"))
+    render_hint("'reconnect' tries again right away.")
+
+def render_delivery(delivery):
+    """After a dropped connection: actions are never sent twice, so say what is known about this one
+    (delivery: unsent / unknown / accepted, see Repl.delivery)."""
+    if delivery == "unsent":
+        say("warn", ("Nothing was sent to the robot", "yellow"), ": run the command again.")
+    elif delivery == "accepted":
+        say("warn", ("The robot accepted the command", "yellow"), "; only the follow-up read was cut off.")
+        render_hint("'status' shows what it is doing now.")
+    else:
+        say("warn", ("The command may or may not have reached the robot", "yellow"), ": it was not sent again.")
+        render_hint("Check 'status' and repeat the command if needed.")
+
+def render_command_cancelled():
+    say("no", ("Cancelled", "yellow"), ": stopped waiting, the robot may already have received the command.")
 
 def render_warning(message):
     say("warn", (message, "yellow"))
