@@ -11,11 +11,13 @@ Later runs reuse it (no new code request, no cloud rate limits).
 import argparse
 import asyncio
 import atexit
+import contextlib
 import dataclasses
 import json
 import pathlib
 import pickle
 import shlex
+import signal
 import sys
 import threading
 
@@ -42,6 +44,7 @@ HISTORY_FILE = STATE_DIR / "history"
 CONSUMABLE_NAMES = [c.value for c in ConsumableAttribute]
 HISTORY_LENGTH = 1000
 NO_RAW_COMMANDS = {"cls", "quit", "exit"}  # nothing to show plainly
+START_TIMEOUT, START_POLL = 30, 2  # seconds: how long / how often to check that a started action really runs
 ASKING_COMMANDS = {"clean", "zone", "goto", "spot", "resume", "pause", "stop", "dock", "routine"}  # accept -y
 
 OPTIONAL_TRAITS = [
@@ -173,6 +176,11 @@ def ainput(prompt, remember=False):
 
     threading.Thread(target=read, daemon=True).start()
     return future
+
+
+def errors_of(status):
+    """(dock error, robot error) as plain ints, 0 = none."""
+    return tuple(int(getattr(e, "value", e) or 0) for e in (status.dock_error_status, status.error_code))
 
 
 def plain(obj, cls):
@@ -542,6 +550,7 @@ class Repl:
     async def send(self, command, params=None):
         result = await self.p.command.send(command, params)
         raw_line(f"{command} -> {result}")
+        return result
 
     def usage(self, name, args=()):
         """Same usage message everywhere: syntax as in 'help', an example and a short note."""
@@ -572,22 +581,68 @@ class Repl:
         return False
 
     async def send_pretty(self, command, params=None, label=None):
-        info_pretty.render_sent(command, await self.p.command.send(command, params), label)
+        result = await self.p.command.send(command, params)
+        info_pretty.render_sent(command, result, label)
+        return result
 
-    async def perform(self, args, command, params=None, ask=None, label=None, hint=None, plan=None):
-        """The one path for commands that act on the robot: plan → confirm → send.
-        Raw mode skips the plan and names the exact command in its question; ask=None sends right away (find)."""
-        if "raw" in args:
-            if not ask or await self.confirm(args, ask, detail=f"{command.value} {params or ''}".rstrip()):
-                await self.send(command, params)
-            return
-        if plan:
-            await plan()
-        if ask and not await self.confirm(args, ask):
-            return
-        await self.send_pretty(command, params, label)
-        if hint:
-            info_pretty.render_hint(hint)
+    async def perform(self, args, command, params=None, ask=None, label=None, hint=None, plan=None, starts=False):
+        """The one path for commands that act on the robot: plan → confirm → send (→ check it started).
+        Raw mode skips the plan and names the exact command in its question; ask=None sends right away (find).
+        starts=True: the command should set the robot working, so watch the status afterwards (check_started)."""
+        raw = "raw" in args
+        if raw:
+            if ask and not await self.confirm(args, ask, detail=f"{command.value} {params or ''}".rstrip()):
+                return
+            if starts:
+                await self.p.status.refresh()  # errors before the start, so only new ones count as failure
+            before = errors_of(self.p.status)
+            result = await self.send(command, params)
+        else:
+            if plan:
+                await plan()  # every plan refreshes the status
+            if ask and not await self.confirm(args, ask):
+                return
+            before = errors_of(self.p.status)
+            result = await self.send_pretty(command, params, label)
+            if hint:
+                info_pretty.render_hint(hint)
+        if starts and result in ("ok", ["ok"]):
+            await self.check_started(raw, before)
+
+    async def check_started(self, raw, before):
+        """Accepted is not started: a missing dust bin, for example, only shows up in the status afterwards.
+        Polls the status until the robot works, reports a (new) error, or START_TIMEOUT passes.
+        Ctrl+C only stops the waiting, not the robot."""
+        status, loop = self.p.status, asyncio.get_running_loop()
+        started = loop.time()
+
+        async def poll():
+            while loop.time() - started < START_TIMEOUT:
+                await asyncio.sleep(START_POLL)
+                await status.refresh()
+                kind = info_pretty.state_kind(status.state_name)
+                if kind == "working":
+                    return "started"
+                if kind == "error" or any(now and now != was for now, was in zip(errors_of(status), before)):
+                    return "error"
+            return "error" if any(errors_of(status)) else "timeout"  # an old error kept it from starting
+
+        task = asyncio.ensure_future(poll())
+        loop.add_signal_handler(signal.SIGINT, task.cancel)
+        try:
+            with contextlib.nullcontext() if raw else \
+                    info_pretty.console.status("Checking that the robot starts ... (Ctrl+C stops waiting)"):
+                outcome = await task
+        except asyncio.CancelledError:
+            outcome = "cancelled"
+        finally:
+            loop.remove_signal_handler(signal.SIGINT)
+        waited = round(loop.time() - started)
+        if raw:
+            dock, error = errors_of(status)
+            return raw_line(f"start check: {outcome} after {waited}s state={status.state_name} "
+                            f"error={status.error_code} dock_error={dock}")
+        info_pretty.render_start_check(outcome, status, waited)
 
     async def refresh_for_plan(self, with_map=False):
         await self.p.status.refresh()  # show the settings the robot will actually use
@@ -606,7 +661,7 @@ class Repl:
         async def plan():
             await self.refresh_for_plan()
             info_pretty.render_clean_plan(self)
-        await self.perform(args, command, params, ask="Start cleaning", plan=plan)
+        await self.perform(args, command, params, ask="Start cleaning", plan=plan, starts=True)
 
     async def cmd_zone(self, *args):
         coords = without(args, "raw", "-y")
@@ -618,7 +673,7 @@ class Repl:
             await self.refresh_for_plan(with_map=True)
             info_pretty.render_zone_plan(self, zone)
         await self.perform(args, RoborockCommand.APP_ZONED_CLEAN, [[*zone, self.passes]], ask="Start zone cleaning",
-                           plan=plan)
+                           plan=plan, starts=True)
 
     async def cmd_goto(self, *args):
         coords = without(args, "raw", "-y")
@@ -656,7 +711,7 @@ class Repl:
         await self.perform(args, RoborockCommand.APP_PAUSE, ask="Pause the robot", label="‖ Pause")
 
     async def cmd_resume(self, *args):
-        await self.perform(args, RoborockCommand.APP_START, ask="Resume the robot", label="▶ Resume")
+        await self.perform(args, RoborockCommand.APP_START, ask="Resume the robot", label="▶ Resume", starts=True)
 
     async def cmd_stop(self, *args):
         await self.perform(args, RoborockCommand.APP_STOP, ask="Stop the robot", label="■ Stop",
@@ -667,7 +722,7 @@ class Repl:
 
     async def cmd_spot(self, *args):
         await self.perform(args, RoborockCommand.APP_SPOT, ask="Start spot cleaning", label="✱ Spot clean",
-                           hint="Cleans the area around the robot.")
+                           hint="Cleans the area around the robot.", starts=True)
 
     async def cmd_find(self, *args):  # the only action that never asks: it just makes the robot speak
         await self.perform(args, RoborockCommand.FIND_ME, label="♪ Find me", hint="The robot announces itself.")
@@ -784,8 +839,11 @@ class Repl:
             return await self.cmd_routines(*args)
         if "raw" in args:
             if await self.confirm(args, f"Start routine {int(values[0])}"):
+                await self.p.status.refresh()
+                before = errors_of(self.p.status)
                 await self.p.routines.execute_routine(int(values[0]))
                 raw_line("Routine started.")
+                await self.check_started(True, before)
             return
         routines = await self.load_routines()
         wanted = values[0].lower()
@@ -797,8 +855,11 @@ class Repl:
         info_pretty.render_routine_start(matches[0])
         if not await self.confirm(args, f"Start routine {matches[0].name or matches[0].id}"):
             return
+        await self.p.status.refresh()
+        before = errors_of(self.p.status)
         await self.p.routines.execute_routine(matches[0].id)
         info_pretty.render_done("Routine started via the Roborock cloud")
+        await self.check_started(False, before)
 
     # ---------- raw ----------
 

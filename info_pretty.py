@@ -792,6 +792,23 @@ def render_sent(command, result, label=None):
                                       " with ", (repr(result), "yellow")))
     console.print(out)
 
+def render_start_check(outcome, s, waited):
+    """After a start command the robot accepted: did it really start? outcome from Repl.check_started."""
+    state = Text(human(s.state_name), style=state_style(s.state_name)[0])
+    error = s.dock_error_status or s.error_code  # dock errors first, like 'resolve'
+    error_text = Text.assemble((human(error), "bold red"), (f" ({int(error)})", "grey50")) if error else None
+    if outcome == "started":
+        say("ok", "Robot is running: ", state, (f"  ({waited} s)", "grey50"))
+    elif outcome == "error":
+        say("error", ("Robot did not start: ", "red"), error_text or state)
+        render_hint("Fix the cause, then 'resolve' clears the error and you can retry.")
+    elif outcome == "timeout":
+        say("warn", (f"No start seen after {waited} s: ", "yellow"), "robot is ", state,
+            *((", error ", error_text) if error_text else ()))
+        render_hint("It may still start: 'status' shows the current state.")
+    else:
+        say("warn", ("Stopped waiting", "yellow"), ": robot is ", state, (" (the robot itself was not affected)", "grey50"))
+
 def render_resolve(status):
     """Say which error gets resolved (dock errors first, like the library). Returns False if there is none."""
     if status.dock_error_status:
